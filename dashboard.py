@@ -13,6 +13,9 @@ from pathlib import Path
 import json
 import warnings
 
+from math import radians, sin, cos, sqrt, asin
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -508,6 +511,18 @@ HOLIDAY_PERIODS = [
     ("2025-12-22", "2025-12-31", "Nataru 2025/26"),
 ]
 
+# ── KONSTANTA GRAPH (dari graph.py) ─────────────────────────────────────────────
+ROAD_FACTOR = 1.3           # fallback haversine -> jalan
+ALPHA_DIST  = 0.6           # bobot jarak
+BETA_PRICE  = 0.4           # bobot disparitas harga
+HIGHWAY_BONUS = {            # diskon bobot untuk hub besar
+    'Kota Surabaya':   0.70,
+    'Kabupaten Gresik': 0.85,
+    'Kabupaten Sidoarjo': 0.85,
+    'Kota Malang':     0.90,
+    'Kota Kediri':     0.90,
+}
+
 # ── UTILITAS ────────────────────────────────────────────────────────────────────
 def normalize_name(name: str) -> str:
     n = str(name).upper().strip()
@@ -535,6 +550,54 @@ def apply_plotly_theme(fig: go.Figure, height: int = 360, **overrides) -> go.Fig
         }
     fig.update_layout(**layout)
     return fig
+
+
+# ── HELPER FUNCTIONS (GRAPH THEORY) ──────────────────────────────────────────
+def normalise_nama(nama):
+    return ' '.join(nama.strip().upper().split())
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return R * 2 * asin(sqrt(a))
+
+
+def road_dist(la1, lo1, la2, lo2):
+    return haversine(la1, lo1, la2, lo2) * ROAD_FACTOR
+
+
+def floyd_warshall(n, adj):
+    """All-pairs shortest path. adj[i]=list of (j,weight)."""
+    dist = np.full((n, n), np.inf)
+    nxt = np.full((n, n), -1, dtype=int)
+    for i in range(n):
+        dist[i, i] = 0
+        nxt[i, i] = i
+        for j, w in adj[i]:
+            dist[i, j] = w
+            nxt[i, j] = j
+    for k in range(n):
+        for i in range(n):
+            if dist[i, k] == np.inf:
+                continue
+            for j in range(n):
+                nd = dist[i, k] + dist[k, j]
+                if nd < dist[i, j] - 1e-12:
+                    dist[i, j] = nd
+                    nxt[i, j] = nxt[i, k]
+    return dist, nxt
+
+
+def reconstruct(nxt, i, j):
+    if nxt[i, j] == -1:
+        return []
+    p = [i]
+    while i != j:
+        i = nxt[i, j]
+        p.append(i)
+    return p
 
 
 # ── FUNGSI LOAD DATA ────────────────────────────────────────────────────────────
@@ -633,14 +696,80 @@ def compute_centrality(threshold_km: float = THRESHOLD_KM):
     return deg_df, btw_df, G
 
 
+# ── FUNGSI GRAPH MATRIX (DI-CACHE UNTUK PERFORMA) ───────────────────────────
+@st.cache_data
+def build_distance_matrix(_osrm: pd.DataFrame, _coords: pd.DataFrame,
+                          kab_list: tuple, threshold_km: float = THRESHOLD_KM):
+    """Bangun distance matrix & adjacency statis dari OSRM (fallback haversine).
+    Returns: kab_list, kab_to_idx, dist_km, adj_static (list of list).
+    """
+    n = len(kab_list)
+    kab_to_idx = {k: i for i, k in enumerate(kab_list)}
+
+    # Koordinat lookup
+    koord_map = {}
+    for _, r in _coords.iterrows():
+        koord_map[normalise_nama(r['nama'])] = (r['latitude'], r['longitude'])
+    name_coord_map = {}
+    for nama in kab_list:
+        k = normalise_nama(nama)
+        if k in koord_map:
+            name_coord_map[nama] = koord_map[k]
+        else:
+            for pfx in ('KABUPATEN ', 'KOTA '):
+                if k.startswith(pfx):
+                    sk = k[len(pfx):]
+                    for kk, vv in koord_map.items():
+                        if kk == sk:
+                            name_coord_map[nama] = vv
+                            break
+
+    # OSRM lookup
+    osrm_lookup = {}
+    for _, r in _osrm.iterrows():
+        a = normalise_nama(r['kab_asal'])
+        b = normalise_nama(r['kab_tujuan'])
+        if pd.notna(r['jarak_km']):
+            osrm_lookup[(a, b)] = r['jarak_km']
+            osrm_lookup[(b, a)] = r['jarak_km']
+
+    dist_km = np.zeros((n, n))
+    adj_static = [[] for _ in range(n)]
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            ki, kj = kab_list[i], kab_list[j]
+            key = (normalise_nama(ki), normalise_nama(kj))
+            if key in osrm_lookup:
+                d_km = osrm_lookup[key]
+            else:
+                la1, lo1 = name_coord_map.get(ki, (0, 0))
+                la2, lo2 = name_coord_map.get(kj, (0, 0))
+                d_km = road_dist(la1, lo1, la2, lo2) if la1 else 9999
+
+            dist_km[i, j] = dist_km[j, i] = d_km
+
+            if d_km <= threshold_km:
+                adj_static[i].append((j, d_km / 500))       # bobot dasar = jarak
+                adj_static[j].append((i, d_km / 500))
+
+    return list(kab_list), kab_to_idx, dist_km, adj_static
+
+
 def get_recommendations(
     df_cls: pd.DataFrame,
     date,
     horizon: int,
     osrm: pd.DataFrame,
+    coords: pd.DataFrame,
     threshold_km: float = THRESHOLD_KM,
     top_n: int = 25,
 ) -> pd.DataFrame:
+    """Rekomendasi distribusi multi-hop menggunakan Floyd-Warshall.
+    
+    Klasifikasi: quantile (25/75) dari dashboard.py
+    Routing: Floyd-Warshall multi-hop dari graph.py dengan bobot dinamis
+    """
     snapshot = df_cls[
         (df_cls["forecast_date"] == pd.Timestamp(date)) &
         (df_cls["horizon"] == horizon)
@@ -653,27 +782,64 @@ def get_recommendations(
     if sources.empty or targets.empty:
         return pd.DataFrame()
 
-    direct = osrm[osrm["jarak_km"] <= threshold_km]
+    # Build dist matrix & adj
+    all_kabs = tuple(sorted(snapshot["kab_kota"].unique()))
+    kab_list, kab_to_idx, dist_km, adj_static = build_distance_matrix(
+        osrm, coords, all_kabs, threshold_km
+    )
+    n = len(kab_list)
+    pred_dict = snapshot.set_index("kab_kota")["prediction"].to_dict()
+
+    # Build dynamic adjacency for THIS date+horizon (bobot: jarak + inverse price diff)
+    adj_dyn = [[] for _ in range(n)]
+    for i in range(n):
+        for j, w_static in adj_static[i]:
+            ki, kj = kab_list[i], kab_list[j]
+            pi = pred_dict.get(ki, 0)
+            pj = pred_dict.get(kj, 0)
+            selisih = abs(pi - pj)
+            # Bobot: jarak + INVERSE selisih harga (selisih besar = bobot kecil = prioritas)
+            w = ALPHA_DIST * (dist_km[i, j] / 500) + BETA_PRICE * (1 / (selisih + 1))
+            w = max(w, 0.001)
+            bonus = min(HIGHWAY_BONUS.get(ki, 1.0), HIGHWAY_BONUS.get(kj, 1.0))
+            w *= bonus
+            adj_dyn[i].append((j, w))
+
+    # Floyd-Warshall untuk shortest path dinamis
+    dist_dyn, nxt = floyd_warshall(n, adj_dyn)
+
+    # Untuk setiap target, cari sumber optimal via shortest path dinamis
+    src_indices = [kab_to_idx[s["kab_kota"]] for _, s in sources.iterrows()
+                   if s["kab_kota"] in kab_to_idx]
+    tgt_indices = [kab_to_idx[t["kab_kota"]] for _, t in targets.iterrows()
+                   if t["kab_kota"] in kab_to_idx]
+
     rows = []
-    for _, src in sources.iterrows():
-        for _, tgt in targets.iterrows():
-            edge = direct[
-                ((direct["kab_asal"] == src["kab_kota"]) & (direct["kab_tujuan"] == tgt["kab_kota"])) |
-                ((direct["kab_asal"] == tgt["kab_kota"]) & (direct["kab_tujuan"] == src["kab_kota"]))
-            ]
-            if edge.empty:
-                continue
-            e = edge.iloc[0]
-            selisih = tgt["prediction"] - src["prediction"]
-            rows.append({
-                "Sumber":        src["kab_kota"],
-                "Tujuan":        tgt["kab_kota"],
-                "Harga Sumber":  int(src["prediction"]),
-                "Harga Tujuan":  int(tgt["prediction"]),
-                "Selisih Harga": int(selisih),
-                "Jarak (km)":    round(e["jarak_km"], 1),
-                "Waktu (menit)": round(e["waktu_menit"], 0),
-            })
+    for ti in tgt_indices:
+        if dist_dyn[ti, :].max() == np.inf:
+            continue
+        # Cari sumber dengan jarak shortest path terendah
+        best_si = min(src_indices, key=lambda s: dist_dyn[ti, s] if dist_dyn[ti, s] != np.inf else 9999)
+        if best_si == ti or dist_dyn[ti, best_si] == np.inf:
+            continue
+
+        path = reconstruct(nxt, best_si, ti)
+        path_names = [kab_list[p] for p in path]
+
+        src_name = kab_list[best_si]
+        tgt_name = kab_list[ti]
+        selisih = pred_dict.get(tgt_name, 0) - pred_dict.get(src_name, 0)
+
+        rows.append({
+            "Sumber":        src_name,
+            "Tujuan":        tgt_name,
+            "Harga Sumber":  int(pred_dict.get(src_name, 0)),
+            "Harga Tujuan":  int(pred_dict.get(tgt_name, 0)),
+            "Selisih Harga": int(selisih),
+            "Jarak (km)":    round(dist_km[ti, best_si], 1),
+            "Jalur":         " → ".join(short_name(n) for n in path_names),
+            "Jumlah Hop":    len(path) - 1,
+        })
 
     if not rows:
         return pd.DataFrame()
@@ -1045,7 +1211,7 @@ with tab3:
     </div>
     """, unsafe_allow_html=True)
 
-    recs = get_recommendations(df_cls, selected_date, horizon, osrm, THRESHOLD_KM)
+    recs = get_recommendations(df_cls, selected_date, horizon, osrm, coords, THRESHOLD_KM)
 
     if recs.empty:
         st.warning("Tidak ada rekomendasi untuk kombinasi ini. Coba horizon atau tanggal lain.")
@@ -1142,7 +1308,10 @@ with tab3:
         display["Harga Sumber"]  = display["Harga Sumber"].map(lambda x: f"Rp {x:,}")
         display["Harga Tujuan"]  = display["Harga Tujuan"].map(lambda x: f"Rp {x:,}")
         display["Selisih Harga"] = display["Selisih Harga"].map(lambda x: f"Rp {x:,}")
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        # Pilih kolom yang akan ditampilkan
+        cols_display = ["Sumber", "Tujuan", "Harga Sumber", "Harga Tujuan",
+                        "Selisih Harga", "Jarak (km)", "Jalur", "Jumlah Hop"]
+        st.dataframe(display[cols_display], use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
