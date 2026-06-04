@@ -1129,26 +1129,26 @@ with tab2:
                                           title_font=dict(size=11, color="#667085")))
             st.plotly_chart(fig_fan, use_container_width=True)
 
-        # — Time series H+1
+        # — Time series sesuai horizon yang dipilih
         with col_ts:
-            st.markdown("""
+            st.markdown(f"""
             <div style="font-size: 12px; font-weight: 600; color: #667085;
                         text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;">
-                Tren Harga H+1 Sepanjang Periode Uji
+                Tren Harga H+{horizon} Sepanjang Periode Uji
             </div>
             """, unsafe_allow_html=True)
-            h1 = kab_data[kab_data["horizon"] == 1].sort_values("forecast_date")
+            hx = kab_data[kab_data["horizon"] == horizon].sort_values("forecast_date")
             fig_ts = go.Figure()
             fig_ts.add_trace(go.Scatter(
-                x=h1["forecast_date"], y=h1["actual"],
+                x=hx["forecast_date"], y=hx["actual"],
                 mode="lines", name="Aktual",
                 line=dict(color=C_GREEN, width=1.6),
                 fill="tozeroy",
                 fillcolor="rgba(18,183,106,0.06)",
             ))
             fig_ts.add_trace(go.Scatter(
-                x=h1["forecast_date"], y=h1["prediction"],
-                mode="lines", name="Prediksi H+1",
+                x=hx["forecast_date"], y=hx["prediction"],
+                mode="lines", name=f"Prediksi H+{horizon}",
                 line=dict(color=C_BLUE, width=1.6),
             ))
             for start, _, label in HOLIDAY_PERIODS:
